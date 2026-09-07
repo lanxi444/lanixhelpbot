@@ -20,7 +20,6 @@ from aiogram.types import (
     BotCommand,
     BotCommandScopeDefault,
     BotCommandScopeChat,
-    ChatPermissions,
     ReactionTypeEmoji,
     BufferedInputFile
 )
@@ -55,6 +54,9 @@ MSK_TIMEZONE = timezone(timedelta(hours=3))
 manual_sleep_mode = False
 manual_sleep_reason = "технический перерыв"
 
+# Глубина непрерывной памяти (сколько последних сообщений загружать в контекст ИИ)
+MEMORY_HISTORY_LIMIT = 30
+
 # --- ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ---
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
@@ -83,9 +85,58 @@ def init_db():
                 setting_val TEXT
             )
         """)
+        # Таблица непрерывной памяти диалога
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chat_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
+                role TEXT,
+                content TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         conn.commit()
 
 init_db()
+
+# --- ФУНКЦИИ НЕПРЕРЫВНОЙ ПАМЯТИ ---
+def save_message_to_memory(chat_id: int, role: str, text: str):
+    """Сохраняет сообщение в постоянную память"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO chat_memory (chat_id, role, content) VALUES (?, ?, ?)",
+                (chat_id, role, text)
+            )
+            conn.commit()
+    except Exception as e:
+        logging.error(f"Ошибка сохранения памяти: {e}")
+
+def get_chat_memory(chat_id: int, limit: int = MEMORY_HISTORY_LIMIT) -> list:
+    """Извлекает историю диалога в хронологическом порядке"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT role, content FROM chat_memory WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
+                (chat_id, limit)
+            )
+            rows = cursor.fetchall()
+            return [{"role": r[0], "text": r[1]} for r in reversed(rows)]
+    except Exception as e:
+        logging.error(f"Ошибка чтения памяти: {e}")
+        return []
+
+def clear_chat_memory(chat_id: int):
+    """Очищает память диалога"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM chat_memory WHERE chat_id = ?", (chat_id,))
+            conn.commit()
+    except Exception as e:
+        logging.error(f"Ошибка очистки памяти: {e}")
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ БАЗЫ ---
 def save_chat_to_db(chat: types.Chat):
@@ -199,9 +250,6 @@ if current_active_model_key not in AVAILABLE_MODELS:
 TRIGGER_WORDS = ["ланикс", "латекс", "линукс", "lanix", "linux"]
 REACTIONS_POOL = ["🔥", "⚡", "👍", "💡", "🤖", "🚀", "❤️", "🎉", "👀", "👌"]
 
-chat_history = defaultdict(list)
-MAX_HISTORY_LEN = 6
-
 CASINO_HOURLY_LIMIT = 5
 user_casino_spins = defaultdict(list)
 user_football_kicks = defaultdict(list)
@@ -234,10 +282,10 @@ SPONTANEOUS_COOLDOWN = 600
 last_spontaneous_reply = defaultdict(float)
 
 PRESET_MODES = {
-    "default": {"title": "🤖 Стандартный", "prompt": "Ты вежливый, живой и универсальный чат-помощник Ланикс. Отвечай понятно, структурированно и по делу."},
-    "coder": {"title": "💻 Программист", "prompt": "Ты Senior Fullstack разработчик Ланикс. Пиши чистый, оптимизированный код с комментариями, поясняй архитектуру."},
-    "translator": {"title": "🌍 Переводчик", "prompt": "Ты профессиональный переводчик. Переводи текст, сохраняя естественность и стиль."},
-    "creative": {"title": "💡 Креативщик", "prompt": "Ты генератор идей и копирайтер Ланикс. Пиши живо, образно и с юмором."},
+    "default": {"title": "🤖 Стандартный", "prompt": "Ты вежливый, живой и универсальный чат-помощник Ланикс. Отвечай понятно, структурированно и по делу. У тебя отличная память: учитывай всю историю беседы с пользователем."},
+    "coder": {"title": "💻 Программист", "prompt": "Ты Senior Fullstack разработчик Ланикс. Пиши чистый, оптимизированный код с комментариями, помни контекст проекта пользователя."},
+    "translator": {"title": "🌍 Переводчик", "prompt": "Ты профессиональный переводчик. Переводи текст, сохраняя естественность и контекст беседы."},
+    "creative": {"title": "💡 Креативщик", "prompt": "Ты генератор идей и копирайтер Ланикс. Пиши живо, образно и с юмором, помни всё, что предлагал ранее."},
     "brief": {"title": "⚡ Кратко", "prompt": "Отвечай максимально кратко, тезисно, без вступлений и заключений."}
 }
 
@@ -294,7 +342,7 @@ async def generate_or_edit_image(prompt: str, input_image_bytes: bytes | None = 
             await asyncio.sleep(0.3)
     raise Exception(f"Image error: {last_error}")
 
-# --- НЕЙРОСЕТИ (ТЕКСТ) ---
+# --- НЕЙРОСЕТИ (ТЕКСТ С ПОДДЕРЖКОЙ ПАМЯТИ) ---
 async def generate_ai_response(prompt: str, system_prompt: str, image_bytes: bytes | None = None, history: list | None = None) -> str:
     global current_gemini_index, current_hf_index
     chosen = AVAILABLE_MODELS.get(current_active_model_key, AVAILABLE_MODELS["gemini"])
@@ -304,11 +352,19 @@ async def generate_ai_response(prompt: str, system_prompt: str, image_bytes: byt
             active_key = GEMINI_KEYS[current_gemini_index % len(GEMINI_KEYS)]
             genai.configure(api_key=active_key)
             model = genai.GenerativeModel(model_name=chosen["model_id"], system_instruction=system_prompt)
+            
+            # Формируем цепочку непрерывной памяти для Gemini
             contents = []
             if history:
                 for msg in history:
-                    contents.append({"role": "user" if msg["role"] == "user" else "model", "parts": [msg["text"]]})
-            contents.append({"role": "user", "parts": [{"mime_type": "image/jpeg", "data": image_bytes}, prompt] if image_bytes else [prompt]})
+                    r = "user" if msg["role"] == "user" else "model"
+                    contents.append({"role": r, "parts": [msg["text"]]})
+            
+            if image_bytes:
+                contents.append({"role": "user", "parts": [{"mime_type": "image/jpeg", "data": image_bytes}, prompt]})
+            else:
+                contents.append({"role": "user", "parts": [prompt]})
+                
             resp = await model.generate_content_async(contents)
             return resp.text or "Пустой ответ."
         except Exception as e:
@@ -325,7 +381,11 @@ async def generate_ai_response(prompt: str, system_prompt: str, image_bytes: byt
                 for msg in history:
                     messages_payload.append({"role": msg["role"], "content": msg["text"]})
             messages_payload.append({"role": "user", "content": prompt})
-            payload = {"model": chosen["model_id"] if chosen["provider"] == "huggingface" else "google/gemma-4-31B-it:preferred", "messages": messages_payload, "max_tokens": 2048}
+            payload = {
+                "model": chosen["model_id"] if chosen["provider"] == "huggingface" else "google/gemma-4-31B-it:preferred",
+                "messages": messages_payload,
+                "max_tokens": 2048
+            }
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
                 async with session.post(url, headers=headers, json=payload) as r:
                     if r.status == 200:
@@ -434,7 +494,7 @@ async def setup_bot_commands(bot_instance: Bot):
         BotCommand(command="puzzle", description="🧩 Головоломка (+150)"),
         BotCommand(command="ttt", description="🎮 Крестики-Нолики"),
         BotCommand(command="bonus", description="🎁 Бонус (+250)"),
-        BotCommand(command="clear", description="🧹 Очистить контекст ИИ"),
+        BotCommand(command="clear", description="🧹 Очистить память диалога"),
     ]
     try:
         await bot_instance.set_my_commands(commands=user_cmds, scope=BotCommandScopeDefault())
@@ -570,8 +630,9 @@ async def start_cmd(message: types.Message):
     if is_admin(message.from_user.id):
         await message.reply(
             f"👋 <b>Панель Администратора ({nick})</b>\n\n"
-            f"🧠 Активная модель: <b>{AVAILABLE_MODELS[current_active_model_key]['name']}</b>\n"
-            f"💰 Баланс: <b>{get_user_balance(message.from_user.id):,} монет</b>\n\n"
+            f"🧠 Модель: <b>{AVAILABLE_MODELS[current_active_model_key]['name']}</b>\n"
+            f"💰 Баланс: <b>{get_user_balance(message.from_user.id):,} монет</b>\n"
+            f"💾 Непрерывная память диалога: <b>Включена</b>\n\n"
             f"👑 <b>Команды управления:</b>\n"
             f"• <code>/model</code> — выбор нейросети\n"
             f"• <code>/modes</code> — выбор стиля ответов\n"
@@ -586,6 +647,7 @@ async def start_cmd(message: types.Message):
         await message.reply(
             f"👋 Привет, <b>{nick}</b>! 😊\n\n"
             f"Я бот-помощник <b>Ланикс</b> ✨\n\n"
+            f"🧠 <b>Я помню всё, о чем мы говорим</b> во время общения!\n"
             f"💰 <b>Экономика:</b> /balance, /top, /bonus\n"
             f"🎮 <b>Игры:</b> /casino, /football, /puzzle, /ttt\n"
             f"🎨 <b>Рисование:</b> <code>ланикс нарисуй [запрос]</code>\n"
@@ -598,6 +660,9 @@ async def start_cmd(message: types.Message):
 async def help_cmd(message: types.Message):
     text = (
         "📖 <b>СПИСОК КОМАНД БОТА:</b>\n\n"
+        "🧠 <b>Память и диалог:</b>\n"
+        "• Я автоматически помню весь ход нашей беседы и факты о вас.\n"
+        "• `/clear` — полностью сбросить и забыть историю диалога\n\n"
         "💰 <b>Экономика:</b>\n"
         "• `/balance` — ваш профиль и баланс монет\n"
         "• `/top` — рейтинг богачей\n"
@@ -608,9 +673,8 @@ async def help_cmd(message: types.Message):
         "• `/football` — пенальти (ставка 50, макс 5 раз в час)\n"
         "• `/puzzle` — загадка (+150 монет за правильный ответ)\n"
         "• `/ttt` — крестики-нолики с другом\n\n"
-        "🎨 <b>Медиа и диалог:</b>\n"
-        "• `ланикс нарисуй [текст]` — генерация картинок\n"
-        "• `/clear` — сбросить контекст диалога ИИ"
+        "🎨 <b>Медиа:</b>\n"
+        "• `ланикс нарисуй [текст]` — генерация картинок"
     )
     if is_admin(message.from_user.id):
         text += (
@@ -624,6 +688,13 @@ async def help_cmd(message: types.Message):
             "• `/myid` — узнать свой ID"
         )
     await message.reply(text, parse_mode="HTML")
+
+# --- ОЧИСТКА ПАМЯТИ ---
+@dp.message(Command("clear"))
+@dp.message(Command("reset"))
+async def clear_history_cmd(message: types.Message):
+    clear_chat_memory(message.chat.id)
+    await message.reply("🧹 <b>Память нашего диалога очищена!</b> Начинаем общение с чистого листа ✨", parse_mode="HTML")
 
 # --- АДМИН-НАКРУТКА ---
 @dp.message(Command("addcoins"))
@@ -725,12 +796,6 @@ async def wakeup_cmd(message: types.Message):
         return
     manual_sleep_mode = False
     await message.reply("🌅 **Бот успешно проснулся и готов к работе!** 🚀", parse_mode="Markdown")
-
-@dp.message(Command("clear"))
-@dp.message(Command("reset"))
-async def clear_history_cmd(message: types.Message):
-    chat_history[message.chat.id].clear()
-    await message.reply("🧹 <b>История диалога успешно очищена!</b> Начинаем с чистого листа ✨", parse_mode="HTML")
 
 # --- ЭКОНОМИКА И ИГРЫ ---
 @dp.message(Command("balance"))
@@ -911,7 +976,7 @@ async def ttt_cmd(message: types.Message):
         "id": g_id, "chat_id": message.chat.id, "player_x_id": challenger.id,
         "player_x_name": get_display_name(challenger.id), "player_o_id": target.id if target else None,
         "player_o_name": get_display_name(target.id) if target else "Любой желающий",
-        "board": [' '] * 9, "current_turn": "X", "status": "pending"
+        "board": [' '] * 9, "current_turn": "X", "status": "playing"
     }
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚔️ Принять", callback_data=f"ttt_acc:{g_id}"), InlineKeyboardButton(text="❌ Отклонить", callback_data=f"ttt_dec:{g_id}")]])
     await message.reply(f"🎮 <b>Крестики-Нолики!</b> ⚔️\n❌ {ttt_games[g_id]['player_x_name']} против ⭕ {ttt_games[g_id]['player_o_name']}", reply_markup=kb, parse_mode="HTML")
@@ -920,11 +985,10 @@ async def ttt_cmd(message: types.Message):
 async def ttt_acc_cb(callback: types.CallbackQuery):
     g_id = int(callback.data.split(":")[1])
     g = ttt_games.get(g_id)
-    if not g or g["status"] != "pending" or callback.from_user.id == g["player_x_id"]:
+    if not g or callback.from_user.id == g["player_x_id"]:
         return
     g["player_o_id"] = callback.from_user.id
     g["player_o_name"] = get_display_name(callback.from_user.id)
-    g["status"] = "playing"
     await callback.message.edit_text(f"⚔️ <b>Игра началась!</b> 🔥\n❌ {g['player_x_name']} VS ⭕ {g['player_o_name']}\n👉 Ход: ❌ <b>{g['player_x_name']}</b>", reply_markup=get_ttt_board_keyboard(g_id, g["board"]), parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("ttt_m:"))
@@ -932,7 +996,7 @@ async def ttt_move_cb(callback: types.CallbackQuery):
     parts = callback.data.split(":")
     g_id, idx = int(parts[1]), int(parts[2])
     g = ttt_games.get(g_id)
-    if not g or g["status"] != "playing":
+    if not g:
         return
     cur_sym = g["current_turn"]
     expected = g["player_x_id"] if cur_sym == "X" else g["player_o_id"]
@@ -940,13 +1004,11 @@ async def ttt_move_cb(callback: types.CallbackQuery):
         return
     g["board"][idx] = cur_sym
     if check_ttt_winner(g["board"], cur_sym):
-        g["status"] = "finished"
         winner_id = g["player_x_id"] if cur_sym == "X" else g["player_o_id"]
         alter_user_balance(winner_id, 100)
         await callback.message.edit_text(f"🎉 <b>ПОБЕДА {cur_sym}!</b> (+100 монет) 🏆", reply_markup=get_ttt_board_keyboard(g_id, g["board"], is_finished=True), parse_mode="HTML")
         return
     if ' ' not in g["board"]:
-        g["status"] = "finished"
         await callback.message.edit_text("🤝 <b>НИЧЬЯ!</b> ⚖️", reply_markup=get_ttt_board_keyboard(g_id, g["board"], is_finished=True), parse_mode="HTML")
         return
     g["current_turn"] = "O" if cur_sym == "X" else "X"
@@ -957,7 +1019,6 @@ async def ttt_move_cb(callback: types.CallbackQuery):
 async def ttt_surr_cb(callback: types.CallbackQuery):
     g_id = int(callback.data.split(":")[1])
     if g_id in ttt_games:
-        ttt_games[g_id]["status"] = "finished"
         await callback.message.edit_text("🏳️ Игра завершена досрочно.")
 
 @dp.callback_query(F.data == "ttt_noop")
@@ -983,18 +1044,21 @@ async def process_photo_message(message: types.Message):
             return
         should_reply, prompt_text = check_bot_trigger(caption, message, (await bot.get_me()).id, (await bot.get_me()).username)
         if should_reply or message.chat.type == "private":
-            reply = await generate_ai_response(prompt_text or "Опиши подробно, что на картинке.", current_system_prompt, image_bytes=img_bytes)
+            history = get_chat_memory(message.chat.id)
+            reply = await generate_ai_response(prompt_text or "Опиши подробно, что на картинке.", current_system_prompt, image_bytes=img_bytes, history=history)
+            save_message_to_memory(message.chat.id, "user", f"[Фото]: {prompt_text or 'Пользователь отправил фото'}")
+            save_message_to_memory(message.chat.id, "assistant", reply)
             await message.reply(reply)
     except Exception:
         pass
 
-# --- ГЛАВНЫЙ ОБРАБОТЧИК ТЕКСТА ---
+# --- ГЛАВНЫЙ ОБРАБОТЧИК ТЕКСТА (НЕПРЕРЫВНАЯ ПАМЯТЬ) ---
 @dp.message()
 async def process_chat_message(message: types.Message):
     save_chat_to_db(message.chat)
     save_user_profile(message.from_user)
 
-    # Защита: не отправляем неизвестные команды в ИИ
+    # Неизвестные команды со слэшем
     if message.text and message.text.startswith("/"):
         await message.reply("⚠️ Неизвестная команда. Введите /help для просмотра списка доступных команд 😊")
         return
@@ -1054,19 +1118,23 @@ async def process_chat_message(message: types.Message):
             pass
         await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
         try:
-            history_context = chat_history[message.chat.id] if message.chat.type == "private" else None
+            # 1. Достаем всю сохраненную историю диалога из базы данных SQLite
+            history_context = get_chat_memory(message.chat.id)
+
+            # 2. Генерируем ответ с полным знанием контекста
             reply = await generate_ai_response(prompt_text, current_system_prompt, history=history_context)
-            if message.chat.type == "private":
-                chat_history[message.chat.id].append({"role": "user", "text": prompt_text})
-                chat_history[message.chat.id].append({"role": "assistant", "text": reply})
-                chat_history[message.chat.id] = chat_history[message.chat.id][-MAX_HISTORY_LEN:]
+
+            # 3. Сохраняем этот вопрос и ответ в память для будущих сообщений
+            save_message_to_memory(message.chat.id, "user", prompt_text)
+            save_message_to_memory(message.chat.id, "assistant", reply)
+
             await message.reply(reply)
         except Exception:
             await message.reply("⚠️ Ошибка генерации ответа. Попробуйте еще раз.")
 
 # --- ВЕБ-СЕРВЕР HEALTH CHECK ДЛЯ RENDER ---
 async def handle_ping(request):
-    return web.Response(text="Bot Lanix is running!")
+    return web.Response(text="Bot Lanix (Persistent Memory Edition) is running!")
 
 async def start_web_server():
     app = web.Application()
@@ -1085,7 +1153,7 @@ async def main():
     except Exception as e:
         logging.warning(f"Команды пропущены: {e}")
     await start_web_server()
-    logging.info("Бот Lanix успешно запущен!")
+    logging.info("Бот Lanix с непрерывной памятью успешно запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
