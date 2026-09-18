@@ -4,3 +4,4 @@ aiohttp
 python-dotenv
 huggingface_hub
 pillow
+edge-tts
