@@ -46,7 +46,6 @@ except Exception:
     ADMIN_ID = 0
 
 PORT = int(os.getenv("PORT", 8080))
-ALERT_USERNAME = "@yasdn"
 
 DB_FILE = "bot_chats.db"
 MSK_TIMEZONE = timezone(timedelta(hours=3))
@@ -56,6 +55,8 @@ manual_sleep_reason = "технический перерыв"
 
 # Глубина непрерывной памяти (сколько последних сообщений загружать в контекст ИИ)
 MEMORY_HISTORY_LIMIT = 30
+# Сколько сообщений хранить в БД на пару чат+пользователь (защита от раздувания БД)
+MEMORY_DB_KEEP = 300
 
 # --- ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ---
 def init_db():
@@ -85,42 +86,63 @@ def init_db():
                 setting_val TEXT
             )
         """)
-        # Таблица непрерывной памяти диалога
+        # Память диалога: теперь с привязкой к конкретному пользователю
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS chat_memory (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER,
+                user_id INTEGER,
                 role TEXT,
                 content TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_facts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
+                user_id INTEGER,
+                fact TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Миграция старой таблицы памяти (без колонки user_id)
+        cursor.execute("PRAGMA table_info(chat_memory)")
+        cols = [c[1] for c in cursor.fetchall()]
+        if "user_id" not in cols:
+            cursor.execute("ALTER TABLE chat_memory ADD COLUMN user_id INTEGER DEFAULT 0")
         conn.commit()
 
 init_db()
 
-# --- ФУНКЦИИ НЕПРЕРЫВНОЙ ПАМЯТИ ---
-def save_message_to_memory(chat_id: int, role: str, text: str):
-    """Сохраняет сообщение в постоянную память"""
+# --- ПАМЯТЬ (ПО КОНКРЕТНОМУ ЧЕЛОВЕКУ) ---
+def save_message_to_memory(chat_id: int, user_id: int, role: str, text: str):
+    """Сохраняет сообщение в постоянную память конкретного пользователя"""
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO chat_memory (chat_id, role, content) VALUES (?, ?, ?)",
-                (chat_id, role, text)
+                "INSERT INTO chat_memory (chat_id, user_id, role, content) VALUES (?, ?, ?, ?)",
+                (chat_id, user_id, role, text[:4000])
+            )
+            # Автоматическая обрезка: оставляем последние MEMORY_DB_KEEP сообщений
+            cursor.execute(
+                """DELETE FROM chat_memory WHERE chat_id = ? AND user_id = ? AND id NOT IN
+                   (SELECT id FROM chat_memory WHERE chat_id = ? AND user_id = ? ORDER BY id DESC LIMIT ?)""",
+                (chat_id, user_id, chat_id, user_id, MEMORY_DB_KEEP)
             )
             conn.commit()
     except Exception as e:
         logging.error(f"Ошибка сохранения памяти: {e}")
 
-def get_chat_memory(chat_id: int, limit: int = MEMORY_HISTORY_LIMIT) -> list:
-    """Извлекает историю диалога в хронологическом порядке"""
+def get_chat_memory(chat_id: int, user_id: int, limit: int = MEMORY_HISTORY_LIMIT) -> list:
+    """Извлекает историю диалога конкретного пользователя в хронологическом порядке"""
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT role, content FROM chat_memory WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
-                (chat_id, limit)
+                "SELECT role, content FROM chat_memory WHERE chat_id = ? AND user_id = ? ORDER BY id DESC LIMIT ?",
+                (chat_id, user_id, limit)
             )
             rows = cursor.fetchall()
             return [{"role": r[0], "text": r[1]} for r in reversed(rows)]
@@ -128,15 +150,73 @@ def get_chat_memory(chat_id: int, limit: int = MEMORY_HISTORY_LIMIT) -> list:
         logging.error(f"Ошибка чтения памяти: {e}")
         return []
 
-def clear_chat_memory(chat_id: int):
-    """Очищает память диалога"""
+def clear_chat_memory(chat_id: int, user_id: int | None = None):
+    """Очищает память диалога (конкретного пользователя или всего чата)"""
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM chat_memory WHERE chat_id = ?", (chat_id,))
+            if user_id is None:
+                cursor.execute("DELETE FROM chat_memory WHERE chat_id = ?", (chat_id,))
+            else:
+                cursor.execute("DELETE FROM chat_memory WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
             conn.commit()
     except Exception as e:
         logging.error(f"Ошибка очистки памяти: {e}")
+
+# --- ФАКТЫ О ПОЛЬЗОВАТЕЛЕ (долгосрочная память) ---
+def save_user_fact(chat_id: int, user_id: int, fact: str):
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO user_facts (chat_id, user_id, fact) VALUES (?, ?, ?)",
+                (chat_id, user_id, fact[:500])
+            )
+            # Не более 20 фактов на человека в чате
+            cursor.execute(
+                """DELETE FROM user_facts WHERE chat_id = ? AND user_id = ? AND id NOT IN
+                   (SELECT id FROM user_facts WHERE chat_id = ? AND user_id = ? ORDER BY id DESC LIMIT 20)""",
+                (chat_id, user_id, chat_id, user_id)
+            )
+            conn.commit()
+    except Exception as e:
+        logging.error(f"Ошибка сохранения факта: {e}")
+
+def get_user_facts(chat_id: int, user_id: int) -> list:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT fact FROM user_facts WHERE chat_id = ? AND user_id = ? ORDER BY id DESC LIMIT 20",
+                (chat_id, user_id)
+            )
+            return [r[0] for r in cursor.fetchall()]
+    except Exception:
+        return []
+
+def delete_user_fact(chat_id: int, user_id: int, idx: int) -> bool:
+    facts = get_user_facts(chat_id, user_id)
+    if 0 <= idx < len(facts):
+        try:
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "DELETE FROM user_facts WHERE chat_id = ? AND user_id = ? AND fact = ?",
+                    (chat_id, user_id, facts[idx])
+                )
+                conn.commit()
+            return True
+        except Exception:
+            return False
+    return False
+
+def build_user_context(chat_id: int, user_id: int, display_name: str) -> str:
+    """Собирает блок контекста о пользователе для системного промпта"""
+    facts = get_user_facts(chat_id, user_id)
+    if not facts:
+        return ""
+    lines = "\n".join(f"• {f}" for f in facts)
+    return f"\n\nФакты о пользователе {display_name} (запомни их и учитывай в ответах):\n{lines}"
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ БАЗЫ ---
 def save_chat_to_db(chat: types.Chat):
@@ -226,6 +306,13 @@ def set_exact_balance(user_id: int, val: int):
         cursor.execute("INSERT INTO user_balances (user_id, balance) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET balance = ?", (user_id, val, val))
         conn.commit()
 
+def parse_int(text: str) -> int | None:
+    """Безопасный парсинг целого числа"""
+    try:
+        return int(text.strip().replace(",", "").replace(" ", ""))
+    except (ValueError, AttributeError):
+        return None
+
 # --- МОДЕЛИ И КЛЮЧИ ---
 raw_gemini_keys = os.getenv("GEMINI_API_KEY", "")
 GEMINI_KEYS = [k.strip() for k in re.split(r'[,;\s\n]+', raw_gemini_keys) if k.strip()]
@@ -237,15 +324,19 @@ current_hf_index = 0
 
 AVAILABLE_MODELS = {
     "gemini": {"name": "✨ Gemini 2.5 Flash", "provider": "google", "model_id": "gemini-2.5-flash"},
-    "gemma4": {"name": "💎 Gemma 4 (HF)", "provider": "huggingface", "model_id": "google/gemma-4-31B-it:preferred"},
-    "glm_flash": {"name": "⚡ GLM 5.3 Flash (HF)", "provider": "huggingface", "model_id": "zai-org/GLM-5.3-Flash:novita"},
-    "glm": {"name": "🌟 GLM 5.3 (HF)", "provider": "huggingface", "model_id": "zai-org/GLM-5.3:novita"},
-    "qwen": {"name": "🇨🇳 Qwen 3 (HF)", "provider": "huggingface", "model_id": "Qwen/Qwen3-Coder-480B-A35B-Instruct:preferred"},
+    "gemma": {"name": "💎 Gemma 3 27B (HF)", "provider": "huggingface", "model_id": "google/gemma-3-27b-it:preferred"},
+    "glm": {"name": "🌟 GLM 4.5 Air (HF)", "provider": "huggingface", "model_id": "zai-org/GLM-4.5-Air:preferred"},
+    "qwen": {"name": "🇨🇳 Qwen 3 32B (HF)", "provider": "huggingface", "model_id": "Qwen/Qwen3-32B:preferred"},
 }
 
 current_active_model_key = get_db_setting("active_model", "gemini")
 if current_active_model_key not in AVAILABLE_MODELS:
     current_active_model_key = "gemini"
+
+# Бесплатные модели изображений через HF Router (работают с обычным HF_TOKEN,
+# бесплатный тариф: https://huggingface.co/settings/tokens — без карты)
+HF_TEXT2IMG_MODELS = ["black-forest-labs/FLUX.1-schnell", "stabilityai/stable-diffusion-3.5-large-turbo"]
+HF_IMG2IMG_MODELS = ["Qwen/Qwen-Image-Edit", "timbrooks/instruct-pix2pix"]
 
 TRIGGER_WORDS = ["ланикс", "латекс", "линукс", "lanix", "linux"]
 REACTIONS_POOL = ["🔥", "⚡", "👍", "💡", "🤖", "🚀", "❤️", "🎉", "👀", "👌"]
@@ -277,9 +368,6 @@ WINDOW_SECONDS = 30
 MAX_STICKERS_LIMIT = 5
 MAX_DUPLICATE_MESSAGES = 5
 MAX_REPEATED_WORDS_IN_MSG = 5
-SPONTANEOUS_CHANCE = 0.03
-SPONTANEOUS_COOLDOWN = 600
-last_spontaneous_reply = defaultdict(float)
 
 PRESET_MODES = {
     "default": {"title": "🤖 Стандартный", "prompt": "Ты вежливый, живой и универсальный чат-помощник Ланикс. Отвечай понятно, структурированно и по делу. У тебя отличная память: учитывай всю историю беседы с пользователем."},
@@ -295,6 +383,14 @@ current_system_prompt = get_db_setting("custom_system_prompt", PRESET_MODES.get(
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 user_tracker = defaultdict(lambda: {"stickers": [], "messages": []})
+_bot_info_cache = None
+
+async def get_bot_info():
+    """Кэшированный get_me — не дергаем API на каждое сообщение"""
+    global _bot_info_cache
+    if _bot_info_cache is None:
+        _bot_info_cache = await bot.get_me()
+    return _bot_info_cache
 
 def is_admin(user_id: int) -> bool:
     return ADMIN_ID != 0 and user_id == ADMIN_ID
@@ -317,54 +413,90 @@ def check_game_hourly_limit(user_id: int, storage: dict) -> tuple[bool, int, int
     storage[user_id].append(now)
     return True, CASINO_HOURLY_LIMIT - len(storage[user_id]), 0
 
-# --- ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ ---
+# --- ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ (HF Router — бесплатно с обычным токеном) ---
+async def _hf_image_call(token: str, prompt: str, input_image_bytes: bytes | None) -> bytes:
+    client = InferenceClient(token=token)
+    def _sync_call():
+        if input_image_bytes:
+            last_err = None
+            for model in HF_IMG2IMG_MODELS:
+                try:
+                    pil_img = client.image_to_image(input_image_bytes, prompt=prompt, model=model)
+                    buf = io.BytesIO()
+                    pil_img.save(buf, format="PNG")
+                    return buf.getvalue()
+                except Exception as e:
+                    last_err = e
+            raise last_err
+        else:
+            last_err = None
+            for model in HF_TEXT2IMG_MODELS:
+                try:
+                    pil_img = client.text_to_image(prompt, model=model)
+                    buf = io.BytesIO()
+                    pil_img.save(buf, format="PNG")
+                    return buf.getvalue()
+                except Exception as e:
+                    last_err = e
+            raise last_err
+    return await asyncio.to_thread(_sync_call)
+
+async def _pollinations_image(prompt: str) -> bytes:
+    """Запасной бесплатный генератор — без какого-либо ключа"""
+    from urllib.parse import quote
+    url = f"https://image.pollinations.ai/prompt/{quote(prompt)}?width=1024&height=1024&nologo=true"
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
+        async with session.get(url) as r:
+            if r.status == 200:
+                data = await r.read()
+                if len(data) > 10000:
+                    return data
+    raise Exception("Pollinations не ответил")
+
 async def generate_or_edit_image(prompt: str, input_image_bytes: bytes | None = None) -> bytes:
     global current_hf_index
-    if not HF_TOKENS or not HAS_HF_HUB:
-        raise ValueError("HF_TOKEN или huggingface_hub не настроены!")
     last_error = None
-    for _ in range(len(HF_TOKENS)):
-        active_token = HF_TOKENS[current_hf_index % len(HF_TOKENS)]
+    if HF_TOKENS and HAS_HF_HUB:
+        for _ in range(len(HF_TOKENS)):
+            active_token = HF_TOKENS[current_hf_index % len(HF_TOKENS)]
+            try:
+                return await _hf_image_call(active_token, prompt, input_image_bytes)
+            except Exception as e:
+                last_error = e
+                current_hf_index = (current_hf_index + 1) % len(HF_TOKENS)
+                await asyncio.sleep(0.3)
+    # Фолбэк без ключа: текст-в-картинку через Pollinations
+    if not input_image_bytes:
         try:
-            client = InferenceClient(provider="fal-ai", api_key=active_token)
-            def _sync_call():
-                if input_image_bytes:
-                    pil_img = client.image_to_image(input_image_bytes, prompt=prompt, model="Qwen/Qwen-Image-Edit")
-                else:
-                    pil_img = client.text_to_image(prompt, model="black-forest-labs/FLUX.1-schnell")
-                buf = io.BytesIO()
-                pil_img.save(buf, format="PNG")
-                return buf.getvalue()
-            return await asyncio.to_thread(_sync_call)
+            return await _pollinations_image(prompt)
         except Exception as e:
             last_error = e
-            current_hf_index = (current_hf_index + 1) % len(HF_TOKENS)
-            await asyncio.sleep(0.3)
     raise Exception(f"Image error: {last_error}")
 
 # --- НЕЙРОСЕТИ (ТЕКСТ С ПОДДЕРЖКОЙ ПАМЯТИ) ---
-async def generate_ai_response(prompt: str, system_prompt: str, image_bytes: bytes | None = None, history: list | None = None) -> str:
+async def generate_ai_response(prompt: str, system_prompt: str, image_bytes: bytes | None = None,
+                               history: list | None = None, user_context: str = "") -> str:
     global current_gemini_index, current_hf_index
     chosen = AVAILABLE_MODELS.get(current_active_model_key, AVAILABLE_MODELS["gemini"])
+    full_system = system_prompt + user_context
 
     if chosen["provider"] == "google" and GEMINI_KEYS and HAS_GENAI:
         try:
             active_key = GEMINI_KEYS[current_gemini_index % len(GEMINI_KEYS)]
             genai.configure(api_key=active_key)
-            model = genai.GenerativeModel(model_name=chosen["model_id"], system_instruction=system_prompt)
-            
-            # Формируем цепочку непрерывной памяти для Gemini
+            model = genai.GenerativeModel(model_name=chosen["model_id"], system_instruction=full_system)
+
             contents = []
             if history:
                 for msg in history:
                     r = "user" if msg["role"] == "user" else "model"
                     contents.append({"role": r, "parts": [msg["text"]]})
-            
+
             if image_bytes:
                 contents.append({"role": "user", "parts": [{"mime_type": "image/jpeg", "data": image_bytes}, prompt]})
             else:
                 contents.append({"role": "user", "parts": [prompt]})
-                
+
             resp = await model.generate_content_async(contents)
             return resp.text or "Пустой ответ."
         except Exception as e:
@@ -372,28 +504,28 @@ async def generate_ai_response(prompt: str, system_prompt: str, image_bytes: byt
             current_gemini_index = (current_gemini_index + 1) % len(GEMINI_KEYS)
 
     if HF_TOKENS:
-        try:
+        hf_model = chosen["model_id"] if chosen["provider"] == "huggingface" else "google/gemma-3-27b-it:preferred"
+        for _ in range(len(HF_TOKENS)):
             active_token = HF_TOKENS[current_hf_index % len(HF_TOKENS)]
-            url = "https://router.huggingface.co/v1/chat/completions"
-            headers = {"Authorization": f"Bearer {active_token}", "Content-Type": "application/json"}
-            messages_payload = [{"role": "system", "content": system_prompt}]
-            if history:
-                for msg in history:
-                    messages_payload.append({"role": msg["role"], "content": msg["text"]})
-            messages_payload.append({"role": "user", "content": prompt})
-            payload = {
-                "model": chosen["model_id"] if chosen["provider"] == "huggingface" else "google/gemma-4-31B-it:preferred",
-                "messages": messages_payload,
-                "max_tokens": 2048
-            }
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
-                async with session.post(url, headers=headers, json=payload) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        return data["choices"][0]["message"]["content"]
-        except Exception as e:
-            logging.warning(f"HF error: {e}")
-            current_hf_index = (current_hf_index + 1) % len(HF_TOKENS)
+            try:
+                url = "https://router.huggingface.co/v1/chat/completions"
+                headers = {"Authorization": f"Bearer {active_token}", "Content-Type": "application/json"}
+                messages_payload = [{"role": "system", "content": full_system}]
+                if history:
+                    for msg in history:
+                        messages_payload.append({"role": msg["role"], "content": msg["text"]})
+                messages_payload.append({"role": "user", "content": prompt})
+                payload = {"model": hf_model, "messages": messages_payload, "max_tokens": 2048}
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
+                    async with session.post(url, headers=headers, json=payload) as r:
+                        if r.status == 200:
+                            data = await r.json()
+                            return data["choices"][0]["message"]["content"]
+                        raise Exception(f"HF status {r.status}: {await r.text()[:200]}")
+            except Exception as e:
+                logging.warning(f"HF error: {e}")
+                current_hf_index = (current_hf_index + 1) % len(HF_TOKENS)
+                await asyncio.sleep(0.3)
 
     return "⚠️ Не удалось получить ответ от нейросети. Попробуйте еще раз."
 
@@ -494,7 +626,9 @@ async def setup_bot_commands(bot_instance: Bot):
         BotCommand(command="puzzle", description="🧩 Головоломка (+150)"),
         BotCommand(command="ttt", description="🎮 Крестики-Нолики"),
         BotCommand(command="bonus", description="🎁 Бонус (+250)"),
-        BotCommand(command="clear", description="🧹 Очистить память диалога"),
+        BotCommand(command="remember", description="💾 Запомнить факт о себе"),
+        BotCommand(command="forget", description="🗑 Забыть факт (/forget номер)"),
+        BotCommand(command="clear", description="🧹 Очистить мою память"),
     ]
     try:
         await bot_instance.set_my_commands(commands=user_cmds, scope=BotCommandScopeDefault())
@@ -632,11 +766,11 @@ async def start_cmd(message: types.Message):
             f"👋 <b>Панель Администратора ({nick})</b>\n\n"
             f"🧠 Модель: <b>{AVAILABLE_MODELS[current_active_model_key]['name']}</b>\n"
             f"💰 Баланс: <b>{get_user_balance(message.from_user.id):,} монет</b>\n"
-            f"💾 Непрерывная память диалога: <b>Включена</b>\n\n"
+            f"💾 Персональная память: <b>Включена</b>\n\n"
             f"👑 <b>Команды управления:</b>\n"
             f"• <code>/model</code> — выбор нейросети\n"
             f"• <code>/modes</code> — выбор стиля ответов\n"
-            f"• <code>/addcoins 50000</code> — начислить себе монет\n"
+            f"• <code>/addcoins 50000</code> — начислить монеты\n"
             f"• <code>/setcoins 100000</code> — установить точный баланс\n"
             f"• <code>/broadcast [текст]</code> — рассылка по чатам\n"
             f"• <code>/stats</code> — статистика пользователей",
@@ -647,11 +781,13 @@ async def start_cmd(message: types.Message):
         await message.reply(
             f"👋 Привет, <b>{nick}</b>! 😊\n\n"
             f"Я бот-помощник <b>Ланикс</b> ✨\n\n"
-            f"🧠 <b>Я помню всё, о чем мы говорим</b> во время общения!\n"
+            f"🧠 <b>Я помню всё, о чём мы говорим</b>, и знаю факты о тебе!\n"
+            f"💾 <code>/remember мне нравится пицца</code> — запомнить факт\n"
+            f"🗑 <code>/forget 1</code> — забыть факт по номеру\n"
             f"💰 <b>Экономика:</b> /balance, /top, /bonus\n"
             f"🎮 <b>Игры:</b> /casino, /football, /puzzle, /ttt\n"
             f"🎨 <b>Рисование:</b> <code>ланикс нарисуй [запрос]</code>\n"
-            f"🧹 <b>Очистить контекст диалога:</b> /clear\n"
+            f"🧹 <code>/clear</code> — очистить мою память о тебе\n"
             f"📖 <b>Все команды:</b> /help",
             parse_mode="HTML"
         )
@@ -660,62 +796,98 @@ async def start_cmd(message: types.Message):
 async def help_cmd(message: types.Message):
     text = (
         "📖 <b>СПИСОК КОМАНД БОТА:</b>\n\n"
-        "🧠 <b>Память и диалог:</b>\n"
-        "• Я автоматически помню весь ход нашей беседы и факты о вас.\n"
-        "• `/clear` — полностью сбросить и забыть историю диалога\n\n"
+        "🧠 <b>Память (персональная, для каждого человека):</b>\n"
+        "• Я автоматически помню наш диалог и факты о тебе\n"
+        "• <code>/remember текст</code> — записать факт о себе\n"
+        "• <code>/forget номер</code> — удалить факт (номера смотри в /remember без аргументов)\n"
+        "• <code>/clear</code> — забыть всю историю диалога с тобой\n\n"
         "💰 <b>Экономика:</b>\n"
-        "• `/balance` — ваш профиль и баланс монет\n"
-        "• `/top` — рейтинг богачей\n"
-        "• `/nick <имя>` — сменить ник в боте\n"
-        "• `/bonus` — ежедневный бонус (+250 монет)\n\n"
+        "• <code>/balance</code> — профиль и баланс\n"
+        "• <code>/top</code> — рейтинг богачей\n"
+        "• <code>/nick имя</code> — сменить ник\n"
+        "• <code>/bonus</code> — ежедневный бонус (+250)\n\n"
         "🎮 <b>Мини-игры:</b>\n"
-        "• `/casino` — слоты (ставка 50, макс 5 раз в час)\n"
-        "• `/football` — пенальти (ставка 50, макс 5 раз в час)\n"
-        "• `/puzzle` — загадка (+150 монет за правильный ответ)\n"
-        "• `/ttt` — крестики-нолики с другом\n\n"
+        "• <code>/casino</code> — слоты (50/спин, макс 5/час)\n"
+        "• <code>/football</code> — пенальти (50/удар, макс 5/час)\n"
+        "• <code>/puzzle</code> — загадка (+150)\n"
+        "• <code>/ttt</code> (ответом на сообщение друга) — крестики-нолики\n\n"
         "🎨 <b>Медиа:</b>\n"
-        "• `ланикс нарисуй [текст]` — генерация картинок"
+        "• <code>ланикс нарисуй [текст]</code> — сгенерировать картинку\n"
+        "• Отправь фото с подписью «ланикс нарисуй ...» — перерисовать/отредактировать\n"
+        "• Отправь фото с вопросом — я его распознаю и отвечу"
     )
     if is_admin(message.from_user.id):
         text += (
             "\n\n👑 <b>Админ-команды:</b>\n"
-            "• `/model` — выбор нейросети\n"
-            "• `/modes` — выбор роли бота\n"
-            "• `/addcoins <число>` — накрутка монет\n"
-            "• `/setcoins <число>` — установить баланс\n"
-            "• `/broadcast <текст>` — рассылка по чатам\n"
-            "• `/stats` — статистика чатов и игроков\n"
-            "• `/myid` — узнать свой ID"
+            "• <code>/model</code> — выбор нейросети\n"
+            "• <code>/modes</code> — выбор роли\n"
+            "• <code>/addcoins ID сумма</code> — начислить монеты\n"
+            "• <code>/setcoins ID сумма</code> — установить баланс\n"
+            "• <code>/broadcast текст</code> — рассылка\n"
+            "• <code>/stats</code> — статистика"
         )
     await message.reply(text, parse_mode="HTML")
 
-# --- ОЧИСТКА ПАМЯТИ ---
+# --- ПАМЯТЬ: ФАКТЫ ---
+@dp.message(Command("remember"))
+async def remember_cmd(message: types.Message, command: CommandObject):
+    uid, cid = message.from_user.id, message.chat.id
+    if not command.args:
+        facts = get_user_facts(cid, uid)
+        if not facts:
+            await message.reply("💾 У меня пока нет сохранённых фактов о тебе.\nЗаписать: <code>/remember мне нравится рок-музыка</code>", parse_mode="HTML")
+            return
+        lines = "\n".join(f"{i+1}. {f}" for i, f in enumerate(facts))
+        await message.reply(f"💾 <b>Факты о тебе в этом чате:</b>\n{lines}\n\nУдалить: <code>/forget номер</code>", parse_mode="HTML")
+        return
+    save_user_fact(cid, uid, command.args.strip())
+    await message.reply(f"💾 <b>Запомнил:</b> <i>{command.args.strip()}</i> ✨\nБуду учитывать в наших разговорах!", parse_mode="HTML")
+
+@dp.message(Command("forget"))
+async def forget_cmd(message: types.Message, command: CommandObject):
+    if not command.args:
+        await message.reply("Использование: <code>/forget 1</code> — удалить факт под номером (список: /remember)", parse_mode="HTML")
+        return
+    idx = parse_int(command.args)
+    if idx is None or idx < 1:
+        await message.reply("⚠️ Укажите номер факта, например: <code>/forget 1</code>", parse_mode="HTML")
+        return
+    if delete_user_fact(message.chat.id, message.from_user.id, idx - 1):
+        await message.reply(f"🗑 Забыл факт №{idx}.")
+    else:
+        await message.reply("⚠️ Факт с таким номером не найден. Список: /remember")
+
+# --- ОЧИСТКА ПАМЯТИ (только своя) ---
 @dp.message(Command("clear"))
 @dp.message(Command("reset"))
 async def clear_history_cmd(message: types.Message):
-    clear_chat_memory(message.chat.id)
-    await message.reply("🧹 <b>Память нашего диалога очищена!</b> Начинаем общение с чистого листа ✨", parse_mode="HTML")
+    clear_chat_memory(message.chat.id, message.from_user.id)
+    await message.reply("🧹 <b>Я забыл всю историю нашего диалога!</b> Начинаем с чистого листа ✨\n(факты из /remember остались — удали их через /forget)", parse_mode="HTML")
 
 # --- АДМИН-НАКРУТКА ---
 @dp.message(Command("addcoins"))
 async def addcoins_cmd(message: types.Message, command: CommandObject):
     if not is_admin(message.from_user.id):
-        await message.reply("⛔ У вас нет прав администратора! Проверьте /myid и переменную ADMIN_ID в Render.")
+        await message.reply("⛔ У вас нет прав администратора! Проверьте /myid и переменную ADMIN_ID.")
         return
     if not command.args:
-        await message.reply("Использование: <code>/addcoins 50000</code>", parse_mode="HTML")
+        await message.reply("Использование: <code>/addcoins 50000</code> или <code>/addcoins ID 50000</code>", parse_mode="HTML")
         return
 
     parts = command.args.split()
     if message.reply_to_message and message.reply_to_message.from_user:
         target_id = message.reply_to_message.from_user.id
-        amt = int(parts[0])
+        amt = parse_int(parts[0])
     elif len(parts) >= 2:
-        target_id = int(parts[0])
-        amt = int(parts[1])
+        target_id = parse_int(parts[0])
+        amt = parse_int(parts[1])
     else:
         target_id = message.from_user.id
-        amt = int(parts[0])
+        amt = parse_int(parts[0])
+
+    if amt is None or (len(parts) >= 2 and target_id is None):
+        await message.reply("⚠️ Сумма должна быть числом. Пример: <code>/addcoins 50000</code>", parse_mode="HTML")
+        return
 
     new_b = alter_user_balance(target_id, amt)
     await message.reply(f"👑 <b>Начислено {amt:,} монет пользователю {get_display_name(target_id)}!</b> 🎉\n💰 Баланс: <b>{new_b:,} монет</b>.", parse_mode="HTML")
@@ -726,19 +898,23 @@ async def setcoins_cmd(message: types.Message, command: CommandObject):
         await message.reply("⛔ У вас нет прав администратора!")
         return
     if not command.args:
-        await message.reply("Использование: <code>/setcoins 100000</code>", parse_mode="HTML")
+        await message.reply("Использование: <code>/setcoins 100000</code> или <code>/setcoins ID 100000</code>", parse_mode="HTML")
         return
 
     parts = command.args.split()
     if message.reply_to_message and message.reply_to_message.from_user:
         target_id = message.reply_to_message.from_user.id
-        val = int(parts[0])
+        val = parse_int(parts[0])
     elif len(parts) >= 2:
-        target_id = int(parts[0])
-        val = int(parts[1])
+        target_id = parse_int(parts[0])
+        val = parse_int(parts[1])
     else:
         target_id = message.from_user.id
-        val = int(parts[0])
+        val = parse_int(parts[0])
+
+    if val is None or val < 0 or (len(parts) >= 2 and target_id is None):
+        await message.reply("⚠️ Баланс должен быть неотрицательным числом.", parse_mode="HTML")
+        return
 
     set_exact_balance(target_id, val)
     await message.reply(f"👑 <b>Баланс пользователя {get_display_name(target_id)} установлен на: {val:,} монет.</b> ✨", parse_mode="HTML")
@@ -778,7 +954,18 @@ async def stats_cmd(message: types.Message):
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM user_balances")
         total_players = cursor.fetchone()[0]
-    await message.reply(f"📊 **Статистика бота:**\n\n• Чатов в базе: **{len(chats)}** 💬\n• Игроков: **{total_players}** 👥", parse_mode="Markdown")
+        cursor.execute("SELECT COUNT(*) FROM chat_memory")
+        total_mem = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM user_facts")
+        total_facts = cursor.fetchone()[0]
+    await message.reply(
+        f"📊 **Статистика бота:**\n\n"
+        f"• Чатов в базе: **{len(chats)}** 💬\n"
+        f"• Игроков: **{total_players}** 👥\n"
+        f"• Сообщений в памяти: **{total_mem}** 🧠\n"
+        f"• Сохранено фактов: **{total_facts}** 💾",
+        parse_mode="Markdown"
+    )
 
 @dp.message(Command("sleep"))
 async def sleep_cmd(message: types.Message, command: CommandObject):
@@ -811,9 +998,11 @@ async def balance_cmd(message: types.Message):
     s_left = max(0, CASINO_HOURLY_LIMIT - len([t for t in user_casino_spins[u_id] if now - t < 3600]))
     k_left = max(0, CASINO_HOURLY_LIMIT - len([t for t in user_football_kicks[u_id] if now - t < 3600]))
 
+    facts_count = len(get_user_facts(message.chat.id, u_id))
     await message.reply(
         f"👤 <b>Профиль игрока {nick}:</b>\n\n"
-        f"🪙 Баланс: <b>{bal:,} монет</b>\n\n"
+        f"🪙 Баланс: <b>{bal:,} монет</b>\n"
+        f"💾 Фактов о тебе в памяти: <b>{facts_count}</b>\n\n"
         f"📊 Доступно в этом часе:\n"
         f"• 🎰 Слоты: <b>{s_left}/5</b>\n"
         f"• ⚽ Пенальти: <b>{k_left}/5</b>\n\n"
@@ -935,18 +1124,14 @@ async def puzzle_callback(callback: types.CallbackQuery):
     parts = callback.data.split(":")
     p_id = int(parts[1])
     ans_idx = int(parts[2])
-    p = active_puzzles.get(p_id)
+    p = active_puzzles.pop(p_id, None)
     if not p:
         await callback.answer("Головоломка недействительна.", show_alert=True)
         return
     if callback.from_user.id != p["user_id"]:
+        active_puzzles[p_id] = p  # вернём обратно, это не тот пользователь
         await callback.answer("⛔ Это не ваша загадка!", show_alert=True)
         return
-    if p["solved"]:
-        await callback.answer("Вы уже ответили!")
-        return
-
-    p["solved"] = True
     if ans_idx == p["correct_idx"]:
         new_b = alter_user_balance(callback.from_user.id, 150)
         await callback.message.edit_text(
@@ -970,22 +1155,44 @@ async def ttt_cmd(message: types.Message):
         return
     challenger = message.from_user
     target = message.reply_to_message.from_user if (message.reply_to_message and message.reply_to_message.from_user) else None
+    if target and (target.is_bot or target.id == challenger.id):
+        await message.reply("⚠️ Нельзя вызвать на игру бота или самого себя!")
+        return
+    # Один активный вызов на пару игроков — чистим завершённые
+    for gid in [g for g, game in ttt_games.items() if game["status"] != "playing"]:
+        ttt_games.pop(gid, None)
     g_id = ttt_game_id_counter
     ttt_game_id_counter += 1
     ttt_games[g_id] = {
         "id": g_id, "chat_id": message.chat.id, "player_x_id": challenger.id,
         "player_x_name": get_display_name(challenger.id), "player_o_id": target.id if target else None,
         "player_o_name": get_display_name(target.id) if target else "Любой желающий",
-        "board": [' '] * 9, "current_turn": "X", "status": "playing"
+        "board": [' '] * 9, "current_turn": "X", "status": "playing",
+        "invited_id": target.id if target else None
     }
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚔️ Принять", callback_data=f"ttt_acc:{g_id}"), InlineKeyboardButton(text="❌ Отклонить", callback_data=f"ttt_dec:{g_id}")]])
     await message.reply(f"🎮 <b>Крестики-Нолики!</b> ⚔️\n❌ {ttt_games[g_id]['player_x_name']} против ⭕ {ttt_games[g_id]['player_o_name']}", reply_markup=kb, parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("ttt_dec:"))
+async def ttt_decline_cb(callback: types.CallbackQuery):
+    g_id = int(callback.data.split(":")[1])
+    g = ttt_games.pop(g_id, None)
+    if g:
+        await callback.message.edit_text("❌ Вызов отклонён.")
 
 @dp.callback_query(F.data.startswith("ttt_acc:"))
 async def ttt_acc_cb(callback: types.CallbackQuery):
     g_id = int(callback.data.split(":")[1])
     g = ttt_games.get(g_id)
-    if not g or callback.from_user.id == g["player_x_id"]:
+    if not g or g["status"] != "playing":
+        await callback.answer("Игра недействительна.")
+        return
+    if callback.from_user.id == g["player_x_id"]:
+        await callback.answer("Вы не можете принять собственный вызов!")
+        return
+    # Если вызов адресован конкретному человеку — принять может только он
+    if g.get("invited_id") and callback.from_user.id != g["invited_id"]:
+        await callback.answer("⛔ Этот вызов адресован другому игроку!", show_alert=True)
         return
     g["player_o_id"] = callback.from_user.id
     g["player_o_name"] = get_display_name(callback.from_user.id)
@@ -996,20 +1203,26 @@ async def ttt_move_cb(callback: types.CallbackQuery):
     parts = callback.data.split(":")
     g_id, idx = int(parts[1]), int(parts[2])
     g = ttt_games.get(g_id)
-    if not g:
+    if not g or g["status"] != "playing":
+        await callback.answer("Игра завершена.")
         return
     cur_sym = g["current_turn"]
     expected = g["player_x_id"] if cur_sym == "X" else g["player_o_id"]
     if callback.from_user.id != expected or g["board"][idx] != ' ':
+        await callback.answer("⛔ Не ваш ход или клетка занята!")
         return
     g["board"][idx] = cur_sym
     if check_ttt_winner(g["board"], cur_sym):
+        g["status"] = "finished"
         winner_id = g["player_x_id"] if cur_sym == "X" else g["player_o_id"]
         alter_user_balance(winner_id, 100)
         await callback.message.edit_text(f"🎉 <b>ПОБЕДА {cur_sym}!</b> (+100 монет) 🏆", reply_markup=get_ttt_board_keyboard(g_id, g["board"], is_finished=True), parse_mode="HTML")
+        ttt_games.pop(g_id, None)
         return
     if ' ' not in g["board"]:
+        g["status"] = "finished"
         await callback.message.edit_text("🤝 <b>НИЧЬЯ!</b> ⚖️", reply_markup=get_ttt_board_keyboard(g_id, g["board"], is_finished=True), parse_mode="HTML")
+        ttt_games.pop(g_id, None)
         return
     g["current_turn"] = "O" if cur_sym == "X" else "X"
     next_n = g["player_o_name"] if g["current_turn"] == "O" else g["player_x_name"]
@@ -1018,8 +1231,10 @@ async def ttt_move_cb(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("ttt_surrender:"))
 async def ttt_surr_cb(callback: types.CallbackQuery):
     g_id = int(callback.data.split(":")[1])
-    if g_id in ttt_games:
-        await callback.message.edit_text("🏳️ Игра завершена досрочно.")
+    g = ttt_games.pop(g_id, None)
+    if g:
+        name = get_display_name(callback.from_user.id)
+        await callback.message.edit_text(f"🏳️ {name} сдался. Игра завершена.")
 
 @dp.callback_query(F.data == "ttt_noop")
 async def ttt_noop(callback: types.CallbackQuery):
@@ -1031,6 +1246,7 @@ async def process_photo_message(message: types.Message):
     save_chat_to_db(message.chat)
     save_user_profile(message.from_user)
     caption = message.caption or ""
+    uid, cid = message.from_user.id, message.chat.id
     is_draw = any(re.search(rf"\b{tr}\s+(нарисуй|перерисуй|сделай)\b", caption.lower()) for tr in TRIGGER_WORDS) or caption.lower().strip().startswith("нарисуй")
     try:
         photo = message.photo[-1]
@@ -1038,25 +1254,45 @@ async def process_photo_message(message: types.Message):
         await bot.download(photo, destination=fs)
         img_bytes = fs.getvalue()
         if is_draw:
-            draw_p = re.sub(r'^(ланикс|латекс|линукс|lanix|linux)?\s*(нарисуй|перерисуй|сделай)\s*', '', caption, flags=re.IGNORECASE).strip() or "Artistic photo"
-            res_b = await generate_or_edit_image(draw_p, input_image_bytes=img_bytes)
+            draw_p = re.sub(r'^(ланикс|латекс|линукс|lanix|linux)?\s*(нарисуй|перерисуй)\s*', '', caption, flags=re.IGNORECASE).strip() or "Improve this photo, make it artistic"
+            await bot.send_chat_action(chat_id=cid, action=ChatAction.UPLOAD_PHOTO)
+            try:
+                res_b = await generate_or_edit_image(draw_p, input_image_bytes=img_bytes)
+            except Exception as e:
+                logging.warning(f"Ошибка редактирования фото: {e}")
+                await message.reply("⚠️ Не удалось обработать изображение. Попробуйте позже.")
+                return
             await message.reply_photo(BufferedInputFile(res_b, filename="art.png"), caption=f"🎨 <b>Готово:</b> <i>{draw_p}</i> ✨", parse_mode="HTML")
             return
-        should_reply, prompt_text = check_bot_trigger(caption, message, (await bot.get_me()).id, (await bot.get_me()).username)
+        bot_info = await get_bot_info()
+        should_reply, prompt_text = check_bot_trigger(caption, message, bot_info.id, bot_info.username)
         if should_reply or message.chat.type == "private":
-            history = get_chat_memory(message.chat.id)
-            reply = await generate_ai_response(prompt_text or "Опиши подробно, что на картинке.", current_system_prompt, image_bytes=img_bytes, history=history)
-            save_message_to_memory(message.chat.id, "user", f"[Фото]: {prompt_text or 'Пользователь отправил фото'}")
-            save_message_to_memory(message.chat.id, "assistant", reply)
+            sleeping, sleep_reason = is_bot_sleeping()
+            if sleeping:
+                await message.reply(f"😴 Бот на техническом перерыве: {sleep_reason}")
+                return
+            await bot.send_chat_action(chat_id=cid, action=ChatAction.TYPING)
+            history = get_chat_memory(cid, uid)
+            u_ctx = build_user_context(cid, uid, get_display_name(uid, message.from_user.first_name))
+            try:
+                reply = await generate_ai_response(prompt_text or "Опиши подробно, что на этой картинке.", current_system_prompt, image_bytes=img_bytes, history=history, user_context=u_ctx)
+            except Exception as e:
+                logging.warning(f"Ошибка распознавания фото: {e}")
+                await message.reply("⚠️ Не удалось распознать изображение. Попробуйте ещё раз.")
+                return
+            save_message_to_memory(cid, uid, "user", f"[Фото]: {prompt_text or 'Пользователь отправил фото'}")
+            save_message_to_memory(cid, uid, "assistant", reply)
             await message.reply(reply)
-    except Exception:
-        pass
+    except Exception as e:
+        logging.warning(f"Ошибка обработки фото: {e}")
+        await message.reply("⚠️ Не удалось скачать или обработать фото.")
 
-# --- ГЛАВНЫЙ ОБРАБОТЧИК ТЕКСТА (НЕПРЕРЫВНАЯ ПАМЯТЬ) ---
+# --- ГЛАВНЫЙ ОБРАБОТЧИК ТЕКСТА ---
 @dp.message()
 async def process_chat_message(message: types.Message):
     save_chat_to_db(message.chat)
     save_user_profile(message.from_user)
+    uid, cid = message.from_user.id, message.chat.id
 
     # Неизвестные команды со слэшем
     if message.text and message.text.startswith("/"):
@@ -1066,6 +1302,7 @@ async def process_chat_message(message: types.Message):
     if message.chat.type in ["group", "supergroup"]:
         is_spam, reason = check_spam_and_flood(message)
         if is_spam:
+            logging.info(f"Спам от {uid} в чате {cid}: {reason}")
             await message.delete()
             return
 
@@ -1091,20 +1328,27 @@ async def process_chat_message(message: types.Message):
         await puzzle_cmd(message)
         return
 
-    # Генерация картинок по фразе «ланикс нарисуй»
-    draw_match = re.search(r'^(ланикс|латекс|линукс|lanix|linux)?\s*(нарисуй|сгенерируй|нарисуй мне)\s+(.+)$', message.text, flags=re.IGNORECASE)
+    # Генерация картинок по фразе «ланикс нарисуй ...»
+    draw_match = re.search(r'^(?:ланикс|латекс|линукс|lanix|linux)?\s*(?:нарисуй|сгенерируй)\s+(.+)$', message.text, flags=re.IGNORECASE)
     if draw_match:
+        draw_p = draw_match.group(1).strip()
+        if len(draw_p) < 3:
+            await message.reply("⚠️ Опиши подробнее, что нарисовать. Пример: <code>ланикс нарисуй кот в космосе</code>", parse_mode="HTML")
+            return
+        sleeping, _ = is_bot_sleeping()
+        if sleeping and message.chat.type != "private":
+            return
         try:
-            draw_p = draw_match.group(3).strip()
-            await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.UPLOAD_PHOTO)
+            await bot.send_chat_action(chat_id=cid, action=ChatAction.UPLOAD_PHOTO)
             gen_b = await generate_or_edit_image(draw_p)
             await message.reply_photo(BufferedInputFile(gen_b, filename="art.png"), caption=f"🎨 <b>Готово:</b> <i>{draw_p}</i> ✨", parse_mode="HTML")
             return
-        except Exception:
-            await message.reply("⚠️ Не удалось сгенерировать изображение.")
+        except Exception as e:
+            logging.warning(f"Ошибка генерации изображения: {e}")
+            await message.reply("⚠️ Не удалось сгенерировать изображение. Попробуйте позже.")
             return
 
-    bot_info = await bot.get_me()
+    bot_info = await get_bot_info()
     should_reply, prompt_text = check_bot_trigger(message.text, message, bot_user_id=bot_info.id, bot_username=bot_info.username)
     sleeping, sleep_reason = is_bot_sleeping()
 
@@ -1116,25 +1360,27 @@ async def process_chat_message(message: types.Message):
             await message.react([ReactionTypeEmoji(emoji=random.choice(REACTIONS_POOL))])
         except Exception:
             pass
-        await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+        await bot.send_chat_action(chat_id=cid, action=ChatAction.TYPING)
         try:
-            # 1. Достаем всю сохраненную историю диалога из базы данных SQLite
-            history_context = get_chat_memory(message.chat.id)
+            # 1. История диалога конкретного человека + сохранённые факты о нём
+            history_context = get_chat_memory(cid, uid)
+            u_ctx = build_user_context(cid, uid, get_display_name(uid, message.from_user.first_name))
 
-            # 2. Генерируем ответ с полным знанием контекста
-            reply = await generate_ai_response(prompt_text, current_system_prompt, history=history_context)
+            # 2. Генерация ответа с полным знанием контекста
+            reply = await generate_ai_response(prompt_text, current_system_prompt, history=history_context, user_context=u_ctx)
 
-            # 3. Сохраняем этот вопрос и ответ в память для будущих сообщений
-            save_message_to_memory(message.chat.id, "user", prompt_text)
-            save_message_to_memory(message.chat.id, "assistant", reply)
+            # 3. Сохранение в память
+            save_message_to_memory(cid, uid, "user", prompt_text)
+            save_message_to_memory(cid, uid, "assistant", reply)
 
             await message.reply(reply)
-        except Exception:
+        except Exception as e:
+            logging.warning(f"Ошибка генерации ответа: {e}")
             await message.reply("⚠️ Ошибка генерации ответа. Попробуйте еще раз.")
 
 # --- ВЕБ-СЕРВЕР HEALTH CHECK ДЛЯ RENDER ---
 async def handle_ping(request):
-    return web.Response(text="Bot Lanix (Persistent Memory Edition) is running!")
+    return web.Response(text="Bot Lanix (Personal Memory Edition) is running!")
 
 async def start_web_server():
     app = web.Application()
@@ -1153,7 +1399,7 @@ async def main():
     except Exception as e:
         logging.warning(f"Команды пропущены: {e}")
     await start_web_server()
-    logging.info("Бот Lanix с непрерывной памятью успешно запущен!")
+    logging.info("Бот Lanix с персональной памятью успешно запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
